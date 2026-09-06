@@ -1,13 +1,14 @@
 {
-  "name": "superlock",
-  "version": "1.0.6",
-  "description": "SuperLock platform CLI",
-  "main": "index.js",
+  "name": "@superlock/cli",
+  "version": "1.0.0",
+  "description": "Official SuperLock Platform CLI",
+  "main": "bin/superlock.js",
   "bin": {
     "superlock": "bin/superlock.js"
   },
   "files": [
-    "bin"
+    "bin",
+    "README.md"
   ],
   "publishConfig": {
     "access": "public"
@@ -18,9 +19,16 @@
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1"
   },
-  "keywords": [],
-  "author": "",
-  "license": "ISC",
+  "keywords": [
+    "superlock",
+    "secrets",
+    "zero-trust",
+    "vault",
+    "env",
+    "cli"
+  ],
+  "author": "SuperLock",
+  "license": "MIT",
   "type": "commonjs",
   "dependencies": {
     "@inquirer/prompts": "^8.3.2",
