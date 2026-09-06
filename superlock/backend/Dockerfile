@@ -16,7 +16,7 @@ COPY . .
 # Build static binary
 RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build \
     -ldflags="-w -s" \
-    -o /nano-server \
+    -o /superlock-server \
     ./cmd/server
 
 # ---- Runtime image ----
@@ -24,9 +24,9 @@ FROM scratch
 
 COPY --from=builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/
 COPY --from=builder /usr/share/zoneinfo /usr/share/zoneinfo
-COPY --from=builder /nano-server /nano-server
+COPY --from=builder /superlock-server /superlock-server
 COPY --from=builder /app/migrations /migrations
 
 EXPOSE 8080
 
-ENTRYPOINT ["/nano-server"]
+ENTRYPOINT ["/superlock-server"]

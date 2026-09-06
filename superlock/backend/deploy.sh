@@ -6,7 +6,7 @@ set -e
 
 PROJECT_ID=${1:-"your-gcp-project-id"}
 REGION=${2:-"us-central1"}
-SERVICE_NAME="nano-api"
+SERVICE_NAME="superlock-api"
 IMAGE="gcr.io/$PROJECT_ID/$SERVICE_NAME"
 
 echo "🔨 Building Docker image..."
