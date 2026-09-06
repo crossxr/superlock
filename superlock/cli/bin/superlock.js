@@ -18,7 +18,7 @@ const chalk = {
   bold: (t) => `\x1b[1m${t}\x1b[0m`,
 };
 
-const API_URL = process.env.SUPERLOCK_API_URL || 'https://api.superlock.dev';
+const API_URL = process.env.SUPERLOCK_API_URL || 'https://superlock-api.superxepic.dev';
 const DASHBOARD_URL = process.env.SUPERLOCK_DASHBOARD_URL || 'https://superlock.superxepic.dev';
 const GLOBAL_CONFIG_PATH = path.join(os.homedir(), '.superlock.json');
 const LOCAL_CONFIG_PATH = path.join(process.cwd(), '.superlockrc');
