@@ -1,0 +1,51 @@
+# History folder ignored as requested
+history/
+
+# Environment and secrets
+.env
+.env.*
+!.env.example
+.env.customkeys
+.env.superlock
+.npmrc
+
+# Node / Frontend / CLI build artifacts
+node_modules/
+.next/
+dist/
+build/
+out/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnpm-debug.log*
+
+# Go build artifacts
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+backend/main.exe
+backend/server.exe
+superlock/backend/main.exe
+superlock/backend/server.exe
+
+# Python artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.venv/
+
+# Java artifacts
+target/
+*.class
+
+# IDE & OS files
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.suo
+*.user
