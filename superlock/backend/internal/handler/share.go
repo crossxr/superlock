@@ -2,22 +2,27 @@ package handler
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
 	"github.com/nan0/backend/internal/model"
+	"github.com/nan0/backend/internal/rbac"
 	"github.com/nan0/backend/internal/respond"
 )
 
 // ── Secret Sharing ──────────────────────────────────────────────────────────
 
 type createShareRequest struct {
-	Label     string            `json:"label"`
-	Secrets   map[string]string `json:"secrets"`
-	ExpiresIn string            `json:"expires_in"` // "1h", "24h", "7d", "30d"
-	MaxViews  int               `json:"max_views"`  // 0 = unlimited
+	Label      string            `json:"label"`
+	EnvID      *uuid.UUID        `json:"env_id,omitempty"`
+	SecretKeys []string          `json:"secret_keys,omitempty"`
+	Secrets    map[string]string `json:"secrets,omitempty"`
+	ExpiresIn  string            `json:"expires_in"` // "1h", "24h", "7d", "30d"
+	MaxViews   int               `json:"max_views"`  // 0 = unlimited
 }
 
 func parseExpiry(expiresIn string) time.Time {
@@ -41,8 +46,8 @@ func (h *Handler) CreateSharedSecret(w http.ResponseWriter, r *http.Request) {
 	userID, _ := getUserID(r)
 
 	var req createShareRequest
-	if err := respond.Decode(r, &req); err != nil || len(req.Secrets) == 0 {
-		respond.Error(w, http.StatusBadRequest, "at least one secret key-value pair is required")
+	if err := respond.Decode(r, &req); err != nil {
+		respond.Error(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
 
@@ -51,8 +56,56 @@ func (h *Handler) CreateSharedSecret(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	secretsMap := make(map[string]string)
+
+	if req.EnvID != nil {
+		env, _ := h.verifyEnvAccess(w, r, *req.EnvID)
+		if env == nil {
+			return
+		}
+
+		if !rbac.CanReadSecret(getRole(r), getScopes(r), env.IsProtected) {
+			respond.Error(w, http.StatusForbidden, "insufficient permissions for this environment")
+			return
+		}
+
+		allSecrets, err := h.Store.ListSecretsByEnv(r.Context(), *req.EnvID)
+		if err != nil {
+			respond.Error(w, http.StatusInternalServerError, "failed to load environment secrets")
+			return
+		}
+
+		keyFilter := make(map[string]bool)
+		for _, k := range req.SecretKeys {
+			keyFilter[strings.ToUpper(strings.TrimSpace(k))] = true
+		}
+
+		for _, s := range allSecrets {
+			if len(keyFilter) > 0 && !keyFilter[strings.ToUpper(s.Key)] {
+				continue
+			}
+			val, err := h.Crypto.Decrypt(s.EncryptedValue, s.EncryptedDEK)
+			if err != nil {
+				respond.Error(w, http.StatusInternalServerError, fmt.Sprintf("decryption failed for key %s", s.Key))
+				return
+			}
+			secretsMap[s.Key] = val
+		}
+	} else {
+		for k, v := range req.Secrets {
+			if strings.TrimSpace(k) != "" {
+				secretsMap[k] = v
+			}
+		}
+	}
+
+	if len(secretsMap) == 0 {
+		respond.Error(w, http.StatusBadRequest, "at least one secret key-value pair is required")
+		return
+	}
+
 	// Encrypt the secrets JSON blob
-	secretsJSON, err := json.Marshal(req.Secrets)
+	secretsJSON, err := json.Marshal(secretsMap)
 	if err != nil {
 		respond.Error(w, http.StatusInternalServerError, "failed to serialize secrets")
 		return
@@ -83,7 +136,7 @@ func (h *Handler) CreateSharedSecret(w http.ResponseWriter, r *http.Request) {
 
 	h.writeAudit(r, orgID, userID, "user", "share.created", "shared_secret", &ss.ID, map[string]interface{}{
 		"label":      label,
-		"key_count":  len(req.Secrets),
+		"key_count":  len(secretsMap),
 		"expires_in": req.ExpiresIn,
 		"max_views":  maxViews,
 	})
