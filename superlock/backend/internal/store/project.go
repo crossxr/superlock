@@ -119,3 +119,9 @@ func (s *Store) ListEnvironmentsByProject(ctx context.Context, projectID uuid.UU
 	}
 	return envs, nil
 }
+
+func (s *Store) DeleteEnvironment(ctx context.Context, id uuid.UUID) error {
+	_, err := s.pool.Exec(ctx, `DELETE FROM environments WHERE id = $1`, id)
+	return err
+}
+

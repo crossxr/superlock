@@ -176,6 +176,7 @@ func NewRouter(cfg Config) http.Handler {
 
 			r.With(readSecrets).Get("/projects/{pid}/envs", h.ListEnvironments)
 			r.With(writeSecrets).Post("/projects/{pid}/envs", h.CreateEnvironment)
+			r.With(deleteSecrets).Delete("/projects/{pid}/envs/{eid}", h.DeleteEnvironment)
 
 			r.With(readSecrets).Get("/projects/{pid}/envs/{eid}/secrets", h.ListSecrets)
 			r.With(writeSecrets).Post("/projects/{pid}/envs/{eid}/secrets", h.CreateSecret)

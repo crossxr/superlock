@@ -241,3 +241,55 @@ func (h *Handler) CreateEnvironment(w http.ResponseWriter, r *http.Request) {
 
 	respond.Created(w, env)
 }
+
+func (h *Handler) DeleteEnvironment(w http.ResponseWriter, r *http.Request) {
+	pid, err := uuid.Parse(chi.URLParam(r, "pid"))
+	if err != nil {
+		respond.Error(w, http.StatusBadRequest, "invalid project ID")
+		return
+	}
+	eid, err := uuid.Parse(chi.URLParam(r, "eid"))
+	if err != nil {
+		respond.Error(w, http.StatusBadRequest, "invalid environment ID")
+		return
+	}
+
+	orgID, _ := getOrgID(r)
+	userID, _ := getUserID(r)
+	role := getRole(r)
+
+	if !rbac.IsAtLeast(role, model.RoleAdmin) {
+		respond.Error(w, http.StatusForbidden, "admin or owner role required")
+		return
+	}
+
+	project, err := h.DB.GetProjectByID(r.Context(), pid)
+	if err != nil || project == nil || project.OrgID != orgID {
+		respond.Error(w, http.StatusNotFound, "project not found")
+		return
+	}
+
+	env, err := h.DB.GetEnvironmentByID(r.Context(), eid)
+	if err != nil || env == nil || env.ProjectID != pid {
+		respond.Error(w, http.StatusNotFound, "environment not found")
+		return
+	}
+
+	if env.IsProtected {
+		respond.Error(w, http.StatusForbidden, "secured environments cannot be deleted")
+		return
+	}
+
+	if err := h.DB.DeleteEnvironment(r.Context(), eid); err != nil {
+		respond.Error(w, http.StatusInternalServerError, "failed to delete environment")
+		return
+	}
+
+	h.writeAudit(r, orgID, userID, "user", "environment.deleted", "environment", &eid, map[string]interface{}{
+		"env_name":   env.Name,
+		"project_id": pid.String(),
+	})
+
+	respond.NoContent(w)
+}
+
