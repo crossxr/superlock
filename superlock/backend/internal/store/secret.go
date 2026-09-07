@@ -183,3 +183,82 @@ func (s *Store) RotateSecretValue(ctx context.Context, secretID uuid.UUID, encVa
 
 	return tx.Commit(ctx)
 }
+
+type BulkImportItem struct {
+	Key            string
+	EncryptedValue string
+	EncryptedDEK   string
+}
+
+type BulkImportResult struct {
+	Created int `json:"created"`
+	Updated int `json:"updated"`
+	Skipped int `json:"skipped"`
+	Total   int `json:"total"`
+}
+
+func (s *Store) BulkImportSecrets(ctx context.Context, envID, userID uuid.UUID, items []BulkImportItem, overwrite bool) (*BulkImportResult, error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("begin bulk import tx: %w", err)
+	}
+	defer tx.Rollback(ctx)
+
+	result := &BulkImportResult{
+		Total: len(items),
+	}
+
+	for _, item := range items {
+		var secretID uuid.UUID
+		var currentVersion int
+		var currentEncValue, currentEncDEK string
+		var createdBy uuid.UUID
+
+		err := tx.QueryRow(ctx, `
+			SELECT id, version, encrypted_value, encrypted_dek, created_by
+			FROM secrets
+			WHERE env_id = $1 AND key = $2 AND deleted_at IS NULL
+		`, envID, item.Key).Scan(&secretID, &currentVersion, &currentEncValue, &currentEncDEK, &createdBy)
+
+		if err == nil {
+			if overwrite {
+				_, err = tx.Exec(ctx, `
+					INSERT INTO secret_versions (id, secret_id, encrypted_value, encrypted_dek, version, created_by)
+					VALUES (gen_random_uuid(), $1, $2, $3, $4, $5)
+				`, secretID, currentEncValue, currentEncDEK, currentVersion, createdBy)
+				if err != nil {
+					return nil, fmt.Errorf("save secret version for %s: %w", item.Key, err)
+				}
+
+				_, err = tx.Exec(ctx, `
+					UPDATE secrets
+					SET encrypted_value = $1, encrypted_dek = $2, version = version + 1, updated_at = NOW()
+					WHERE id = $3
+				`, item.EncryptedValue, item.EncryptedDEK, secretID)
+				if err != nil {
+					return nil, fmt.Errorf("update secret %s: %w", item.Key, err)
+				}
+				result.Updated++
+			} else {
+				result.Skipped++
+			}
+		} else if err == pgx.ErrNoRows {
+			_, err = tx.Exec(ctx, `
+				INSERT INTO secrets (id, env_id, key, encrypted_value, encrypted_dek, version, created_by)
+				VALUES (gen_random_uuid(), $1, $2, $3, $4, 1, $5)
+			`, envID, item.Key, item.EncryptedValue, item.EncryptedDEK, userID)
+			if err != nil {
+				return nil, fmt.Errorf("create secret %s: %w", item.Key, err)
+			}
+			result.Created++
+		} else {
+			return nil, fmt.Errorf("check existing secret %s: %w", item.Key, err)
+		}
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return nil, fmt.Errorf("commit bulk import: %w", err)
+	}
+
+	return result, nil
+}

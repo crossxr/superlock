@@ -180,6 +180,7 @@ func NewRouter(cfg Config) http.Handler {
 
 			r.With(readSecrets).Get("/projects/{pid}/envs/{eid}/secrets", h.ListSecrets)
 			r.With(writeSecrets).Post("/projects/{pid}/envs/{eid}/secrets", h.CreateSecret)
+			r.With(writeSecrets).Post("/projects/{pid}/envs/{eid}/secrets/bulk", h.BulkImportSecrets)
 			r.With(readSecrets).Get("/secrets/{sid}", h.GetSecret)
 			r.With(writeSecrets).Put("/secrets/{sid}", h.UpdateSecret)
 			r.With(deleteSecrets).Delete("/secrets/{sid}", h.DeleteSecret)

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+	"sync"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
@@ -13,6 +14,7 @@ import (
 	"github.com/nan0/backend/internal/rbac"
 	"github.com/nan0/backend/internal/references"
 	"github.com/nan0/backend/internal/respond"
+	"github.com/nan0/backend/internal/store"
 )
 
 type createSecretRequest struct {
@@ -473,3 +475,140 @@ func (h *Handler) WatchEnvironment(w http.ResponseWriter, r *http.Request) {
 
 	h.Hub.ServeWS(w, r, eid.String())
 }
+
+type bulkImportSecretPayload struct {
+	Key   string `json:"key"`
+	Value string `json:"value"`
+}
+
+type bulkImportRequest struct {
+	Secrets   []bulkImportSecretPayload `json:"secrets"`
+	Overwrite bool                      `json:"overwrite"`
+}
+
+func (h *Handler) BulkImportSecrets(w http.ResponseWriter, r *http.Request) {
+	eid, err := uuid.Parse(chi.URLParam(r, "eid"))
+	if err != nil {
+		respond.Error(w, http.StatusBadRequest, "invalid environment ID")
+		return
+	}
+
+	env, _ := h.verifyEnvAccess(w, r, eid)
+	if env == nil {
+		return
+	}
+
+	orgID, _ := getOrgID(r)
+	userID, _ := getUserID(r)
+	role := getRole(r)
+
+	if !rbac.CanWriteSecret(role, getScopes(r), env.IsProtected) {
+		respond.Error(w, http.StatusForbidden, "insufficient permissions for this environment")
+		return
+	}
+
+	var req bulkImportRequest
+	if err := respond.Decode(r, &req); err != nil {
+		respond.Error(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+
+	if len(req.Secrets) == 0 {
+		respond.Error(w, http.StatusBadRequest, "at least one secret is required")
+		return
+	}
+
+	if h.Crypto == nil {
+		respond.Error(w, http.StatusServiceUnavailable, "encryption engine not configured")
+		return
+	}
+
+	// Clean and normalize keys, deduplicate within payload
+	cleanItems := make(map[string]string)
+	for _, s := range req.Secrets {
+		k := strings.TrimSpace(strings.ToUpper(s.Key))
+		if k != "" {
+			cleanItems[k] = s.Value
+		}
+	}
+
+	if len(cleanItems) == 0 {
+		respond.Error(w, http.StatusBadRequest, "no valid secrets provided")
+		return
+	}
+
+	// Plan enforcement check
+	org, _ := h.Store.GetOrganizationByID(r.Context(), orgID)
+	if org != nil {
+		limits := billing.GetLimits(org.PlanTier)
+		currentCount, _ := h.Store.CountOrgSecrets(r.Context(), orgID)
+		if limits.MaxSecrets > 0 && currentCount >= limits.MaxSecrets {
+			respond.Error(w, http.StatusPaymentRequired, fmt.Sprintf("secret limit reached (%d on %s plan) — upgrade to create more", limits.MaxSecrets, org.PlanTier))
+			return
+		}
+	}
+
+	// Encrypt all secrets concurrently in memory
+	type encryptedItem struct {
+		key            string
+		encryptedValue string
+		encryptedDEK   string
+		err            error
+	}
+
+	resultsChan := make(chan encryptedItem, len(cleanItems))
+	var wg sync.WaitGroup
+
+	for k, v := range cleanItems {
+		wg.Add(1)
+		go func(key, val string) {
+			defer wg.Done()
+			encVal, encDEK, err := h.Crypto.Encrypt(val)
+			resultsChan <- encryptedItem{
+				key:            key,
+				encryptedValue: encVal,
+				encryptedDEK:   encDEK,
+				err:            err,
+			}
+		}(k, v)
+	}
+
+	wg.Wait()
+	close(resultsChan)
+
+	importItems := make([]store.BulkImportItem, 0, len(cleanItems))
+	for res := range resultsChan {
+		if res.err != nil {
+			respond.Error(w, http.StatusInternalServerError, fmt.Sprintf("encryption failed for secret %s", res.key))
+			return
+		}
+		importItems = append(importItems, store.BulkImportItem{
+			Key:            res.key,
+			EncryptedValue: res.encryptedValue,
+			EncryptedDEK:   res.encryptedDEK,
+		})
+	}
+
+	// Write to database in a single atomic transaction
+	result, err := h.Store.BulkImportSecrets(r.Context(), eid, userID, importItems, req.Overwrite)
+	if err != nil {
+		respond.Error(w, http.StatusInternalServerError, fmt.Sprintf("failed to import secrets: %v", err))
+		return
+	}
+
+	// Invalidate environment cache once
+	if h.Cache != nil {
+		_ = h.Cache.InvalidateEnvEtag(r.Context(), eid.String())
+	}
+
+	// Write single audit log
+	h.writeAudit(r, orgID, userID, "user", "secret.bulk_create", "environment", &eid, map[string]interface{}{
+		"count":   result.Total,
+		"created": result.Created,
+		"updated": result.Updated,
+		"skipped": result.Skipped,
+	})
+
+	respond.OK(w, result)
+}
+
