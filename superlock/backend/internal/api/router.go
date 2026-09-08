@@ -149,6 +149,12 @@ func NewRouter(cfg Config) http.Handler {
 		// Public share link — no auth required
 		r.Get("/share/{shareId}", h.GetSharedSecret)
 
+		// CLI loopback login (P0-8) — exchanging a one-time PKCE code for a
+		// token is deliberately unauthenticated: the CLI has no credentials
+		// yet, and the code is single-use, short-lived, and useless without
+		// the code_verifier only the CLI process holds. See CLIAuthToken.
+		r.Post("/cli/auth/token", h.CLIAuthToken)
+
 		// Invitation accept (needs JWT but no org)
 		r.With(jwtAuth).Get("/invitations/accept", h.AcceptInvitation)
 
@@ -156,6 +162,10 @@ func NewRouter(cfg Config) http.Handler {
 		r.With(jwtAuth).Post("/orgs", h.CreateOrg)
 		r.With(jwtAuth).Get("/orgs/me", h.GetMyOrg)
 		r.With(jwtAuth).Get("/me", h.GetMe)
+
+		// CLI loopback login: mints the one-time code once the user approves
+		// the request shown by `superlock auth login`.
+		r.With(jwtAuth, middleware.RequireOrg).Post("/cli/auth/authorize", h.CLIAuthorize)
 
 		// Protected routes (require auth + org) — accepts both JWT and API token
 		r.Group(func(r chi.Router) {

@@ -125,6 +125,25 @@ type APIToken struct {
 	PlainToken string     `json:"token,omitempty"`
 }
 
+// CLILoginCode is a short-lived, single-use PKCE authorization code minted
+// when a user approves a CLI login in the browser. The CLI's loopback server
+// exchanges it once for a real API token — the token itself is never created
+// until a code_verifier is presented that proves possession of the
+// code_challenge the CLI generated, so nothing sensitive transits the browser
+// redirect and a leaked code alone (browser history, referrer, a proxy log)
+// is not enough to redeem it.
+type CLILoginCode struct {
+	ID            uuid.UUID  `json:"id" db:"id"`
+	OrgID         uuid.UUID  `json:"org_id" db:"org_id"`
+	UserID        uuid.UUID  `json:"user_id" db:"user_id"`
+	Role          Role       `json:"role" db:"role"`
+	CodeHash      string     `json:"-" db:"code_hash"`
+	CodeChallenge string     `json:"-" db:"code_challenge"`
+	UsedAt        *time.Time `json:"used_at" db:"used_at"`
+	ExpiresAt     time.Time  `json:"expires_at" db:"expires_at"`
+	CreatedAt     time.Time  `json:"created_at" db:"created_at"`
+}
+
 type ProjectMember struct {
 	ID        uuid.UUID `json:"id" db:"id"`
 	ProjectID uuid.UUID `json:"project_id" db:"project_id"`
