@@ -100,6 +100,15 @@ All endpoints require `Authorization: Bearer <token>` unless noted. Responses ar
 | `POST` | `/tokens` | Create token `{ name, scopes, expires_at? }` |
 | `DELETE` | `/tokens/{tid}` | Revoke token |
 
+### CLI Login (Loopback PKCE)
+
+`superlock auth login` opens the dashboard in a browser and receives the result on a `127.0.0.1`-only loopback listener. The API token is never placed in that redirect — the browser hands back a one-time authorization code, and the CLI (which alone holds the PKCE `code_verifier`) exchanges it here for the real token.
+
+| Method | Path | Auth | Description |
+|---|---|---|---|
+| `POST` | `/cli/auth/authorize` | JWT | Dashboard call, after the user approves: mints a one-time code bound to `{ code_challenge, code_challenge_method: "S256" }`. Returns `{ code, expires_in }`; the code expires in 60s and is scoped to every permission the approving user's role has (`rbac.ScopesForRole`). |
+| `POST` | `/cli/auth/token` | None | CLI call: exchanges `{ code, code_verifier }` for `{ token }`. Unauthenticated by design — safe because the code is single-use (claimed atomically), short-lived, and redeems nothing without the matching verifier. |
+
 ### SDK Endpoint (API Token Only)
 
 | Method | Path | Description |
