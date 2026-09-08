@@ -2,10 +2,16 @@
 
 const { program } = require('commander');
 const http = require('http');
+const crypto = require('crypto');
 const fs = require('fs/promises');
 const path = require('path');
 const os = require('os');
 const { spawn } = require('child_process');
+
+// Unpadded base64url, per RFC 7636 (PKCE) and RFC 4648 §5.
+function base64url(buf) {
+  return buf.toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
 
 // ── NEON VOLT TERMINAL DESIGN SYSTEM ──
 const chalk = {
@@ -32,9 +38,28 @@ async function getConfig() {
   }
 }
 
+// Restricts the token file to the current user. fs.chmod's mode only applies
+// on create (a pre-existing file keeps its old bits) and, on Windows, only
+// toggles the read-only attribute rather than expressing owner-only access —
+// so Windows gets an ACL reset instead of a POSIX mode.
+async function restrictToOwner(filePath) {
+  if (process.platform === 'win32') {
+    const { execFile } = require('child_process');
+    const username = os.userInfo().username;
+    await new Promise((resolve) => {
+      execFile('icacls', [filePath, '/inheritance:r', '/grant:r', `${username}:F`], () => resolve());
+    });
+    return;
+  }
+  await fs.chmod(filePath, 0o600).catch(() => {});
+}
+
 async function saveConfig(cfg) {
   const existing = await getConfig();
-  await fs.writeFile(GLOBAL_CONFIG_PATH, JSON.stringify({ ...existing, ...cfg }, null, 2));
+  // The token file holds a live credential — owner-only, whether it's being
+  // created fresh or already existed with looser permissions.
+  await fs.writeFile(GLOBAL_CONFIG_PATH, JSON.stringify({ ...existing, ...cfg }, null, 2), { mode: 0o600 });
+  await restrictToOwner(GLOBAL_CONFIG_PATH);
 }
 
 async function getLocalConfig() {
@@ -110,18 +135,95 @@ authCommand
   .description('Authenticate device with cluster via SSO')
   .action(async () => {
     console.log(chalk.voltBg(' AUTH ') + chalk.bold(' Initializing secure handshake...'));
-    const server = http.createServer();
+
+    // Per-attempt state nonce (checked against the loopback callback so an
+    // unrelated page can't drive a request into it on its own) and a PKCE
+    // pair (RFC 7636): the browser redirect never carries the API token —
+    // only a one-time code bound to codeChallenge. Redeeming it here requires
+    // codeVerifier, which never leaves this process, so a code exposed in
+    // browser history, a Referer header, or a proxy log is worthless alone.
+    const state = base64url(crypto.randomBytes(16));
+    const codeVerifier = base64url(crypto.randomBytes(32));
+    const codeChallenge = base64url(crypto.createHash('sha256').update(codeVerifier).digest());
+
     const port = Math.floor(Math.random() * 10000) + 10000;
+    const validHosts = new Set([`127.0.0.1:${port}`, `localhost:${port}`]);
+    const server = http.createServer();
+
+    let answered = false;
+    let expireTimer;
+
+    function finish(exitCode) {
+      clearTimeout(expireTimer);
+      server.close();
+      process.exit(exitCode);
+    }
 
     server.on('request', async (req, res) => {
-      const host = req.headers.host;
-      const url = new URL(req.url, `http://${host}`);
-      if (url.pathname === '/callback') {
-        const token = url.searchParams.get('token');
-        if (token) {
-          await saveConfig({ token });
-          res.writeHead(200, { 'Content-Type': 'text/html' });
-          res.end(`
+      const hostHeader = req.headers.host || `127.0.0.1:${port}`;
+      const url = new URL(req.url, `http://${hostHeader}`);
+
+      // Anything other than the callback (browsers auto-request /favicon.ico,
+      // for instance) is ignored rather than treated as our one answer.
+      if (url.pathname !== '/callback') {
+        res.writeHead(404).end();
+        return;
+      }
+
+      // This is the callback — the server answers exactly once, whatever the
+      // outcome, and then shuts down. No retries, so there's no window for
+      // repeated guesses against state or the exchange endpoint.
+      if (answered) {
+        res.writeHead(410).end('ERR: Already Answered');
+        return;
+      }
+      answered = true;
+
+      if (!validHosts.has(hostHeader)) {
+        res.writeHead(400).end('ERR: Invalid Host');
+        console.error(chalk.red('[ ERR ]') + ` Callback arrived with unexpected Host: ${hostHeader}`);
+        finish(1);
+        return;
+      }
+
+      if (url.searchParams.get('state') !== state) {
+        res.writeHead(400).end('ERR: State Mismatch');
+        console.error(chalk.red('[ ERR ]') + ' Callback state did not match — rejecting.');
+        finish(1);
+        return;
+      }
+
+      const code = url.searchParams.get('code');
+      if (!code) {
+        res.writeHead(400).end('ERR: Missing Code');
+        console.error(chalk.red('[ ERR ]') + ' Callback carried no authorization code.');
+        finish(1);
+        return;
+      }
+
+      let token;
+      try {
+        const exchangeRes = await fetch(`${API_URL}/v1/cli/auth/token`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ code, code_verifier: codeVerifier }),
+        });
+        if (!exchangeRes.ok) {
+          const body = await exchangeRes.json().catch(() => ({}));
+          throw new Error(body.message || `exchange failed (${exchangeRes.status})`);
+        }
+        ({ token } = await exchangeRes.json());
+        if (!token) throw new Error('exchange response carried no token');
+      } catch (err) {
+        res.writeHead(502).end('ERR: Exchange Failed');
+        console.error(chalk.red('[ ERR ]') + ` Failed to redeem authorization code: ${err.message}`);
+        finish(1);
+        return;
+      }
+
+      await saveConfig({ token });
+      res.writeHead(200, { 'Content-Type': 'text/html' });
+      res.end(`
             <!DOCTYPE html>
             <html lang="en">
               <head>
@@ -216,7 +318,7 @@ authCommand
                 <div style="position: absolute; bottom: 48px; left: 48px; right: 48px; display: flex; justify-content: space-between; border-top: 1px solid rgba(0,0,0,0.08); padding-top: 32px;">
                    <div style="display: flex; flex-direction: column;">
                       <span style="font-size: 9px; font-weight: 900; color: rgba(0,0,0,0.3); text-transform: uppercase; letter-spacing: 0.1em;">Local Port</span>
-                      <span style="font-family: 'Inconsolata', monospace; font-size: 12px; font-weight: 700; text-transform: uppercase;">\${port}</span>
+                      <span style="font-family: 'Inconsolata', monospace; font-size: 12px; font-weight: 700; text-transform: uppercase;">${port}</span>
                    </div>
                    <div style="display: flex; flex-direction: column; text-align: right;">
                       <span style="font-size: 9px; font-weight: 900; color: rgba(0,0,0,0.3); text-transform: uppercase; letter-spacing: 0.1em;">Status</span>
@@ -227,20 +329,17 @@ authCommand
               </body>
             </html>
           `);
-          console.log(chalk.volt('[ OK ]') + ' Cryptographic identity established');
-          console.log(chalk.dim(`[ SYS ] Root token persisted to ${GLOBAL_CONFIG_PATH}`));
-          server.close();
-          process.exit(0);
-        } else {
-          res.writeHead(400).end('ERR: Missing Token');
-        }
-      } else {
-        res.writeHead(404).end();
-      }
+      console.log(chalk.volt('[ OK ]') + ' Cryptographic identity established');
+      console.log(chalk.dim(`[ SYS ] Root token persisted to ${GLOBAL_CONFIG_PATH}`));
+      finish(0);
     });
 
-    server.listen(port, async () => {
-      const authUrl = `${DASHBOARD_URL}/cli/auth?port=${port}`;
+    // Loopback only — never on all interfaces. Anyone reachable at this
+    // address before the real redirect lands can only burn the single answer
+    // slot above; they cannot exchange a token without a valid code, and code
+    // issuance itself requires a real, authenticated dashboard approval.
+    server.listen(port, '127.0.0.1', async () => {
+      const authUrl = `${DASHBOARD_URL}/cli/auth?port=${port}&state=${encodeURIComponent(state)}&challenge=${encodeURIComponent(codeChallenge)}`;
       console.log(chalk.dim(`[ SYS ] Browser launch vector: ${authUrl}`));
       try {
         const openPkg = await import('open');
@@ -250,6 +349,13 @@ authCommand
         console.log(chalk.dim(`[ SYS ] Intercept trigger failed. Manual execution required: ${authUrl}`));
       }
     });
+
+    expireTimer = setTimeout(() => {
+      if (answered) return;
+      answered = true;
+      console.error(chalk.red('[ ERR ]') + ' Login timed out after 60s — no callback received.');
+      finish(1);
+    }, 60000);
   });
 
 // Link
