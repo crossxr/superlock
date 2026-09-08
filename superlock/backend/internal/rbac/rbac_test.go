@@ -162,3 +162,25 @@ func TestRoleSnapshotSemantics(t *testing.T) {
 		t.Errorf("demotion did not reach an existing token: got %s", got)
 	}
 }
+
+// ScopesForRole backs the CLI login exchange, which mints a token on the
+// user's behalf with no explicit scope list — it must carry exactly what
+// HasPermission grants the role, nothing more and nothing less.
+func TestScopesForRole(t *testing.T) {
+	for role, want := range rolePermissions {
+		got := ScopesForRole(role)
+		if len(got) != len(want) {
+			t.Fatalf("ScopesForRole(%s) = %v, want %v", role, got, want)
+		}
+		for _, perm := range want {
+			if !Allows(role, got, perm) {
+				t.Errorf("ScopesForRole(%s) omitted %s", role, perm)
+			}
+		}
+		for _, s := range got {
+			if !HasPermission(role, Permission(s)) {
+				t.Errorf("ScopesForRole(%s) included %s the role does not have", role, s)
+			}
+		}
+	}
+}

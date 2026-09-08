@@ -128,6 +128,20 @@ func ValidScope(s string) bool {
 	return false
 }
 
+// ScopesForRole returns every scope a role may be granted, in AllScopes
+// order. Used by flows that mint a token on a role's behalf without an
+// explicit scope list — e.g. the CLI login exchange — so the token carries
+// exactly what the role allows, never more.
+func ScopesForRole(role model.Role) []string {
+	scopes := make([]string, 0, len(AllScopes))
+	for _, p := range AllScopes {
+		if HasPermission(role, p) {
+			scopes = append(scopes, string(p))
+		}
+	}
+	return scopes
+}
+
 // ScopesAllow reports whether a token carrying these scopes may exercise perm.
 //
 // A nil slice means "not scope-limited" — a user JWT rather than an API token.
