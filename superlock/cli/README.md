@@ -30,12 +30,20 @@ superlock auth login
 
 Opens your browser to verify your identity and establishes a cryptographic session on your local machine.
 
-### 2. Link Project & Environment
+### 2. Link Project, Environment & Local `.env`
 
-Navigate to your application repository and link it to a SuperLock project boundary:
+Navigate to your application repository and bind it to a SuperLock environment:
 
 ```bash
 superlock link
+```
+
+An interactive walkthrough: pick a project (or create one), pick an environment (or create one), pick the local env file it maps to, then optionally **push** those local variables into the vault or **pull** the vault's secrets down into the file. The binding lands in `.superlockrc` — IDs only, never values — and later commands in that directory default to the bound environment.
+
+Every step has a flag, so CI never has to answer a prompt:
+
+```bash
+superlock link -p <projectId> -e production -f .env --no-sync
 ```
 
 ### 3. Run Process with Injected Secrets
@@ -53,7 +61,7 @@ superlock run -- npm run dev
 | Command | Description |
 |---|---|
 | `superlock auth login` | Authenticate CLI via SSO / Web dashboard |
-| `superlock link` | Link local working directory to a SuperLock remote project |
+| `superlock link` | Bind the working directory and a local env file to a remote environment, with optional push/pull sync |
 | `superlock run -- <cmd>` | Inject runtime secrets directly into process execution |
 | `superlock pull` | Export environment secrets securely to local `.env.superlock` |
 | `superlock secret set <key> <val>` | Write or update a secret in the linked environment |
