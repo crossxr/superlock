@@ -24,6 +24,20 @@ const chalk = {
   bold: (t) => `\x1b[1m${t}\x1b[0m`,
 };
 
+// Ctrl+C (or a closed stdin) at an interactive prompt is a cancellation, not a
+// crash — inquirer signals it by rejecting with ExitPromptError, which would
+// otherwise reach the user as a stack trace.
+function handleFatal(err) {
+  if (err && err.name === 'ExitPromptError') {
+    console.log(chalk.dim('[ SYS ] Aborted.'));
+    process.exit(130);
+  }
+  console.error(chalk.red('[ ERR ]') + ` ${err && err.stack ? err.stack : err}`);
+  process.exit(1);
+}
+process.on('uncaughtException', handleFatal);
+process.on('unhandledRejection', handleFatal);
+
 const API_URL = process.env.SUPERLOCK_API_URL || 'https://superlock-api-587208374116.us-central1.run.app';
 const DASHBOARD_URL = process.env.SUPERLOCK_DASHBOARD_URL || 'https://superlock.superxepic.dev';
 const GLOBAL_CONFIG_PATH = path.join(os.homedir(), '.superlock.json');
@@ -121,6 +135,132 @@ async function getEnvId(projectId, envName) {
     process.exit(1);
   }
   return env.id;
+}
+
+// ── Local .env file handling ───────────────────────────────────────────────
+//
+// Example/template files are never sync candidates: they hold placeholders,
+// and pushing them would overwrite real cloud values with dummy ones.
+const ENV_TEMPLATE_SUFFIX = /\.(example|sample|template|dist)$/i;
+
+async function detectEnvFiles() {
+  let entries;
+  try {
+    entries = await fs.readdir(process.cwd(), { withFileTypes: true });
+  } catch {
+    return [];
+  }
+  return entries
+    .filter((e) => e.isFile())
+    .map((e) => e.name)
+    .filter((name) => (name === '.env' || name.startsWith('.env.')) && !ENV_TEMPLATE_SUFFIX.test(name))
+    .sort((a, b) => a.length - b.length || a.localeCompare(b));
+}
+
+// Finds the index of the quote that closes a value, skipping backslash-escaped
+// quotes inside double-quoted values.
+function findClosingQuote(text, quote) {
+  for (let i = 0; i < text.length; i++) {
+    if (text[i] === '\\' && quote === '"') {
+      i++;
+      continue;
+    }
+    if (text[i] === quote) return i;
+  }
+  return -1;
+}
+
+// Parses .env content into ordered { key, value } pairs. Handles comments,
+// `export ` prefixes, quoted (including multi-line) values, escape sequences
+// in double-quoted values, inline comments, and duplicate keys (last wins).
+function parseEnvContent(content) {
+  const entries = [];
+  const indexByKey = new Map();
+  const lines = content.replace(/\r\n?/g, '\n').split('\n');
+
+  for (let i = 0; i < lines.length; i++) {
+    const trimmed = lines[i].trim();
+    if (!trimmed || trimmed.startsWith('#')) continue;
+
+    const decl = trimmed.startsWith('export ') ? trimmed.slice(7).trim() : trimmed;
+    const eq = decl.indexOf('=');
+    if (eq === -1) continue;
+
+    const key = decl.slice(0, eq).trim();
+    if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(key)) continue;
+
+    const rest = decl.slice(eq + 1).trim();
+    let value;
+    const quote = rest[0];
+
+    if (quote === '"' || quote === "'") {
+      const buffer = [];
+      let body = rest.slice(1);
+      for (;;) {
+        const close = findClosingQuote(body, quote);
+        if (close !== -1) {
+          buffer.push(body.slice(0, close));
+          break;
+        }
+        buffer.push(body);
+        i++;
+        if (i >= lines.length) break;
+        body = lines[i];
+      }
+      value = buffer.join('\n');
+      if (quote === '"') {
+        value = value
+          .replace(/\\n/g, '\n')
+          .replace(/\\r/g, '\r')
+          .replace(/\\t/g, '\t')
+          .replace(/\\"/g, '"')
+          .replace(/\\\\/g, '\\');
+      }
+    } else {
+      const inlineComment = rest.search(/\s#/);
+      value = (inlineComment === -1 ? rest : rest.slice(0, inlineComment)).trim();
+    }
+
+    if (indexByKey.has(key)) {
+      entries[indexByKey.get(key)].value = value;
+    } else {
+      indexByKey.set(key, entries.length);
+      entries.push({ key, value });
+    }
+  }
+
+  return entries;
+}
+
+function serializeEnvValue(value) {
+  const raw = value == null ? '' : String(value);
+  if (raw === '') return '';
+  if (/[\s#'"\\]/.test(raw)) {
+    return `"${raw.replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/\n/g, '\\n').replace(/\r/g, '\\r')}"`;
+  }
+  return raw;
+}
+
+// Keeps a plaintext secrets file out of version control. Silent no-op when the
+// entry is already there.
+async function ensureGitignored(fileName) {
+  const gitignorePath = path.join(process.cwd(), '.gitignore');
+  try {
+    const gitignore = await fs.readFile(gitignorePath, 'utf-8');
+    if (gitignore.split(/\r?\n/).some((line) => line.trim() === fileName)) return;
+    const prefix = gitignore.endsWith('\n') ? '' : '\n';
+    await fs.appendFile(gitignorePath, `${prefix}${fileName}\n`);
+    console.log(chalk.dim(`[ SYS ] Added ${fileName} to .gitignore`));
+  } catch {
+    await fs.writeFile(gitignorePath, `${fileName}\n`);
+    console.log(chalk.dim(`[ SYS ] Created .gitignore with ${fileName} entry`));
+  }
+}
+
+// The environment `superlock link` bound to this directory wins when --env is
+// omitted; 'production' stays the fallback for an unbound directory.
+function resolveEnvName(flagValue, local) {
+  return flagValue || local.envName || 'production';
 }
 
 program
@@ -358,28 +498,269 @@ authCommand
     }, 60000);
   });
 
-// Link
+// ── Link: bind a local env file to a cloud environment ─────────────────────
+//
+// Interactive by design — every step can be skipped with a flag, and anything
+// missing on the remote side (project, environment) can be created inline
+// rather than sending the user to the dashboard mid-flow.
+
+async function resolveProject(projectIdFlag) {
+  const res = await apiRequest('/v1/projects');
+  const projects = Array.isArray(res?.projects) ? res.projects : Array.isArray(res) ? res : [];
+
+  if (projectIdFlag) {
+    const found = projects.find((p) => p.id === projectIdFlag || p.slug === projectIdFlag);
+    if (!found) {
+      console.error(chalk.red('[ ERR ]') + ` Project '${projectIdFlag}' not resolved in this organization.`);
+      process.exit(1);
+    }
+    return found;
+  }
+
+  const { select } = require('@inquirer/prompts');
+
+  if (projects.length === 0) {
+    console.log(chalk.dim('[ SYS ] Zero project boundaries detected in this organization.'));
+    return createProjectInteractive();
+  }
+
+  const choice = await select({
+    message: chalk.volt('Select project space to tether:'),
+    choices: [
+      ...projects.map((p) => ({
+        name: chalk.bold(p.name) + chalk.dim(` (${p.slug})`),
+        value: p.id,
+      })),
+      { name: chalk.volt('+ Instantiate new project'), value: '__create__' },
+    ],
+  });
+
+  if (choice === '__create__') return createProjectInteractive();
+  return projects.find((p) => p.id === choice);
+}
+
+async function createProjectInteractive() {
+  const { input } = require('@inquirer/prompts');
+  const name = await input({
+    message: chalk.volt('New project name:'),
+    validate: (v) => (v.trim() ? true : 'A name is required'),
+  });
+  const description = await input({ message: chalk.volt('Description (optional):') });
+
+  const project = await apiRequest('/v1/projects', 'POST', {
+    name: name.trim(),
+    description: description.trim(),
+  });
+  console.log(chalk.volt('[ OK ]') + ` Project ${chalk.bold(project.name)} instantiated`);
+  return project;
+}
+
+async function resolveEnvironment(projectId, envNameFlag) {
+  const res = await apiRequest(`/v1/projects/${projectId}/envs`);
+  const envs = Array.isArray(res?.environments) ? res.environments : Array.isArray(res) ? res : [];
+
+  const { select, confirm } = require('@inquirer/prompts');
+
+  if (envNameFlag) {
+    const found = envs.find((e) => e.name === envNameFlag || e.slug === envNameFlag);
+    if (found) return found;
+    console.log(chalk.dim(`[ SYS ] Environment '${envNameFlag}' absent from this project boundary.`));
+    const create = await confirm({
+      message: chalk.volt(`Initialize environment '${envNameFlag}' now?`),
+      default: true,
+    });
+    if (!create) process.exit(1);
+    return createEnvironmentInteractive(projectId, envNameFlag);
+  }
+
+  if (envs.length === 0) {
+    console.log(chalk.dim('[ SYS ] No environments detected in this project boundary.'));
+    return createEnvironmentInteractive(projectId);
+  }
+
+  const choice = await select({
+    message: chalk.volt('Select environment to bind:'),
+    choices: [
+      ...envs.map((e) => ({
+        name: chalk.bold(e.name) + (e.is_protected ? chalk.red(' [SECURED]') : ''),
+        value: e.id,
+      })),
+      { name: chalk.volt('+ Initialize new environment'), value: '__create__' },
+    ],
+  });
+
+  if (choice === '__create__') return createEnvironmentInteractive(projectId);
+  return envs.find((e) => e.id === choice);
+}
+
+async function createEnvironmentInteractive(projectId, presetName) {
+  const { input, confirm } = require('@inquirer/prompts');
+  const name =
+    presetName ||
+    (await input({
+      message: chalk.volt('New environment name:'),
+      default: 'development',
+      validate: (v) => (v.trim() ? true : 'A name is required'),
+    }));
+  const isProtected = await confirm({
+    message: chalk.volt('Mark as secured (owner/admin access only)?'),
+    default: false,
+  });
+
+  const env = await apiRequest(`/v1/projects/${projectId}/envs`, 'POST', {
+    name: name.trim(),
+    is_protected: isProtected,
+  });
+  console.log(chalk.volt('[ OK ]') + ` Environment ${chalk.bold(env.name)} initialized`);
+  return env;
+}
+
+async function resolveEnvFile(fileFlag) {
+  if (fileFlag) return fileFlag;
+
+  const { select, input } = require('@inquirer/prompts');
+  const detected = await detectEnvFiles();
+  if (detected.length === 0) {
+    console.log(chalk.dim('[ SYS ] No local .env file detected in this directory.'));
+  }
+
+  const choice = await select({
+    message: chalk.volt('Select the local env file to bind:'),
+    choices: [
+      ...detected.map((name) => ({ name: chalk.bold(name), value: name })),
+      { name: chalk.dim('Specify a different path...'), value: '__manual__' },
+      { name: chalk.dim('Skip — bind the environment only'), value: '__none__' },
+    ],
+  });
+
+  if (choice === '__none__') return null;
+  if (choice === '__manual__') {
+    const manual = await input({
+      message: chalk.volt('Path to local env file:'),
+      default: '.env',
+      validate: (v) => (v.trim() ? true : 'A path is required'),
+    });
+    return manual.trim();
+  }
+  return choice;
+}
+
 program.command('link')
-  .description('Synchronize current directory to a remote project boundary')
-  .action(async () => {
-    const res = await apiRequest('/v1/projects');
-    const projects = res?.projects || res;
-    if (!projects || !Array.isArray(projects) || projects.length === 0) {
-      console.error(chalk.red('[ ERR ]') + ' Zero active projects identified. Please instantiate on the dashboard.');
+  .description('Interactively bind a local env file to a SuperLock cloud environment')
+  .option('-p, --project <projectId>', 'Project ID or slug (skips selection)')
+  .option('-e, --env <envName>', 'Environment name (skips selection)')
+  .option('-f, --file <path>', 'Local env file to bind (skips selection)')
+  .option('--no-sync', 'Bind only — never offer to push or pull values')
+  .action(async (options) => {
+    console.log(chalk.voltBg(' LINK ') + chalk.bold(' Binding local workspace to cloud boundary...'));
+
+    const project = await resolveProject(options.project);
+    const env = await resolveEnvironment(project.id, options.env);
+    const envFile = await resolveEnvFile(options.file);
+
+    await saveLocalConfig({
+      projectId: project.id,
+      projectName: project.name,
+      envId: env.id,
+      envName: env.name,
+      envFile: envFile || null,
+    });
+
+    console.log(chalk.volt('[ OK ]') + ` ${chalk.bold(project.name)} / ${chalk.bold(env.name)} tethered to this directory`);
+    console.log(chalk.dim(`[ SYS ] Binding persisted to ${LOCAL_CONFIG_PATH}`));
+    if (envFile) console.log(chalk.dim(`[ SYS ] Local file bound: ${envFile}`));
+
+    if (!envFile || options.sync === false) return;
+
+    // ── Sync step ──
+    const filePath = path.isAbsolute(envFile) ? envFile : path.join(process.cwd(), envFile);
+    let localEntries = [];
+    let fileExists = true;
+    try {
+      localEntries = parseEnvContent(await fs.readFile(filePath, 'utf-8'));
+    } catch {
+      fileExists = false;
+      console.log(chalk.dim(`[ SYS ] ${envFile} not present on disk yet.`));
+    }
+
+    const remoteRes = await apiRequest(`/v1/projects/${project.id}/envs/${env.id}/secrets`);
+    const remoteSecrets = Array.isArray(remoteRes?.secrets) ? remoteRes.secrets : Array.isArray(remoteRes) ? remoteRes : [];
+
+    console.log(
+      chalk.dim(`[ SYS ] Local: ${localEntries.length} variable(s)  |  Cloud [${env.name}]: ${remoteSecrets.length} secret(s)`)
+    );
+
+    const { select, confirm } = require('@inquirer/prompts');
+    const direction = await select({
+      message: chalk.volt('Synchronize now?'),
+      choices: [
+        {
+          name: `Push  ${chalk.dim(`${envFile} → [${env.name}]`)}`,
+          value: 'push',
+          disabled: localEntries.length === 0 ? '(no local variables)' : false,
+        },
+        {
+          name: `Pull  ${chalk.dim(`[${env.name}] → ${envFile}`)}`,
+          value: 'pull',
+          disabled: remoteSecrets.length === 0 ? '(no cloud secrets)' : false,
+        },
+        { name: chalk.dim('Nothing — binding only'), value: 'none' },
+      ],
+    });
+
+    if (direction === 'push') {
+      const overwrite = await confirm({
+        message: chalk.volt('Overwrite keys that already exist in the cloud?'),
+        default: true,
+      });
+
+      const result = await apiRequest(
+        `/v1/projects/${project.id}/envs/${env.id}/secrets/bulk`,
+        'POST',
+        { secrets: localEntries.map(({ key, value }) => ({ key, value })), overwrite }
+      );
+
+      console.log(
+        chalk.volt('[ OK ]') +
+          ` Push complete — ${result?.created ?? 0} created, ${result?.updated ?? 0} updated, ${result?.skipped ?? 0} skipped`
+      );
+      await ensureGitignored(path.basename(envFile));
       return;
     }
 
-    const { select } = require('@inquirer/prompts');
-    const projectId = await select({
-      message: chalk.volt('Select project space to tether:'),
-      choices: projects.map(p => ({
-        name: chalk.bold(p.name) + chalk.dim(` (${p.slug})`),
-        value: p.id
-      }))
-    });
+    if (direction === 'pull') {
+      if (fileExists && localEntries.length > 0) {
+        const overwriteFile = await confirm({
+          message: chalk.red(`Overwrite ${envFile} (${localEntries.length} local variable(s)) with cloud values?`),
+          default: false,
+        });
+        if (!overwriteFile) {
+          console.log(chalk.dim('[ SYS ] Pull aborted — local file untouched.'));
+          return;
+        }
+      }
 
-    await saveLocalConfig({ projectId });
-    console.log(chalk.volt('[ OK ]') + ` Directory tethered to cluster bound ${projectId}`);
+      const values = await apiRequest(`/v1/envs/${env.id}/secrets/values`);
+      if (!values || typeof values !== 'object') {
+        console.error(chalk.red('[ ERR ]') + ' Failed to retrieve secrets from vault.');
+        process.exit(1);
+      }
+
+      const keys = Object.keys(values);
+      const header = [
+        '# SuperLock-managed environment file',
+        `# Project: ${project.name}`,
+        `# Environment: ${env.name}`,
+        `# Generated: ${new Date().toISOString()}`,
+        '# WARNING: This file contains sensitive data. Do NOT commit to version control.',
+        '',
+      ].join('\n');
+      const body = keys.map((key) => `${key}=${serializeEnvValue(values[key])}`).join('\n');
+      await fs.writeFile(filePath, header + body + '\n');
+
+      console.log(chalk.volt('[ OK ]') + ` ${keys.length} secret(s) written to ${chalk.bold(envFile)}`);
+      await ensureGitignored(path.basename(envFile));
+    }
   });
 
 // Secret
@@ -387,7 +768,7 @@ const secretCommand = program.command('secret').description('Vault management di
 secretCommand
   .command('set <key>')
   .description('Cipher a secret into a specific environment')
-  .option('--env <environment>', 'Target environment', 'production')
+  .option('--env <environment>', 'Target environment (default: linked env)')
   .option('--value <value>', 'Raw payload value')
   .action(async (key, options) => {
     const local = await getLocalConfig();
@@ -396,32 +777,34 @@ secretCommand
       process.exit(1);
     }
 
+    const envName = resolveEnvName(options.env, local);
     const value = options.value || await require('@inquirer/prompts').password({ message: chalk.volt(`Input cipher value for [${key}]:`) });
-    const envId = await getEnvId(local.projectId, options.env);
+    const envId = await getEnvId(local.projectId, envName);
 
     await apiRequest(`/v1/projects/${local.projectId}/envs/${envId}/secrets`, 'POST', {
       key,
       value
     });
 
-    console.log(chalk.volt('[ OK ]') + ` Payload ${chalk.bold(key)} encrypted into [${options.env}] boundary`);
+    console.log(chalk.volt('[ OK ]') + ` Payload ${chalk.bold(key)} encrypted into [${envName}] boundary`);
   });
 
 secretCommand
   .command('get <key>')
   .description('Decrypt a secret payload from an environment')
-  .option('--env <environment>', 'Target environment', 'production')
+  .option('--env <environment>', 'Target environment (default: linked env)')
   .action(async (key, options) => {
     const local = await getLocalConfig();
     if (!local.projectId) {
       console.error(chalk.red('[ ERR ]') + ' Terminal detached. Trigger `superlock link` first.');
       process.exit(1);
     }
-    const envId = await getEnvId(local.projectId, options.env);
-    
+    const envName = resolveEnvName(options.env, local);
+    const envId = await getEnvId(local.projectId, envName);
+
     const res = await apiRequest(`/v1/projects/${local.projectId}/envs/${envId}/secrets`);
     const secrets = res?.secrets || res;
-    
+
     if (!Array.isArray(secrets)) {
         console.error(chalk.red('[ ERR ]') + ' Malformed decryption protocol.');
         process.exit(1);
@@ -430,7 +813,7 @@ secretCommand
     const secret = secrets.find(s => s.key === key);
     
     if (!secret) {
-      console.error(chalk.red('[ ERR ]') + ` Parameter [${key}] absent in [${options.env}] boundary.`);
+      console.error(chalk.red('[ ERR ]') + ` Parameter [${key}] absent in [${envName}] boundary.`);
       process.exit(1);
     }
 
@@ -441,7 +824,7 @@ secretCommand
 program
   .command('run')
   .description('Inject decrypted variables directly into a process execution shell')
-  .option('--env <environment>', 'Target injection environment', 'production')
+  .option('--env <environment>', 'Target injection environment (default: linked env)')
   .argument('[cmd...]', 'Target execution command')
   .allowUnknownOption()
   .action(async (cmdArgs, options, command) => {
@@ -456,10 +839,11 @@ program
       process.exit(1);
     }
 
-    const envId = await getEnvId(local.projectId, options.env);
+    const envName = resolveEnvName(options.env, local);
+    const envId = await getEnvId(local.projectId, envName);
     const res = await apiRequest(`/v1/projects/${local.projectId}/envs/${envId}/secrets`);
     const secrets = res?.secrets || res;
-    
+
     const injectedEnv = {};
     if (secrets && Array.isArray(secrets)) {
       for (const s of secrets) {
@@ -468,7 +852,7 @@ program
     }
 
     const targetEnv = { ...process.env, ...injectedEnv };
-    console.log(chalk.voltBg(' EXEC ') + chalk.bold(` Overriding process shell with ${Object.keys(injectedEnv).length} parameters from [${options.env}]`));
+    console.log(chalk.voltBg(' EXEC ') + chalk.bold(` Overriding process shell with ${Object.keys(injectedEnv).length} parameters from [${envName}]`));
 
     const child = spawn(cmdArgs[0], cmdArgs.slice(1), {
       stdio: 'inherit',
@@ -680,19 +1064,7 @@ program
     console.log(chalk.volt('[ OK ]') + ` ${keys.length} secrets exported to ${chalk.bold('.env.superlock')}`);
     console.log(chalk.dim(`[ SYS ] File: ${envFilePath}`));
 
-    // Ensure .gitignore includes .env.superlock
-    const gitignorePath = path.join(process.cwd(), '.gitignore');
-    try {
-      const gitignore = await fs.readFile(gitignorePath, 'utf-8');
-      if (!gitignore.includes('.env.superlock')) {
-        await fs.appendFile(gitignorePath, '\n.env.superlock\n');
-        console.log(chalk.dim('[ SYS ] Added .env.superlock to .gitignore'));
-      }
-    } catch {
-      // No .gitignore exists — create one
-      await fs.writeFile(gitignorePath, '.env.superlock\n');
-      console.log(chalk.dim('[ SYS ] Created .gitignore with .env.superlock entry'));
-    }
+    await ensureGitignored('.env.superlock');
   });
 
 program.parse(process.argv);
