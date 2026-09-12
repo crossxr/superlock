@@ -76,8 +76,14 @@ func NewRouter(cfg Config) http.Handler {
 	sentryHandler := sentryhttp.New(sentryhttp.Options{Repanic: true})
 	r.Use(sentryHandler.Handle)
 
-	origins := strings.Split(cfg.AllowedOrigins, ",")
-	if len(origins) == 0 || (len(origins) == 1 && origins[0] == "") {
+	rawOrigins := strings.Split(cfg.AllowedOrigins, ",")
+	var origins []string
+	for _, o := range rawOrigins {
+		if trimmed := strings.TrimSpace(o); trimmed != "" {
+			origins = append(origins, trimmed)
+		}
+	}
+	if len(origins) == 0 {
 		origins = []string{"http://localhost:3000"}
 	}
 	r.Use(cors.Handler(cors.Options{
